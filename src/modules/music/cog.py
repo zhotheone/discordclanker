@@ -176,7 +176,7 @@ class MusicCog(commands.Cog):
             )
 
             player = self.manager.get_or_create(interaction.guild)  # type: ignore[arg-type]
-            if not player._vc:
+            if not player.is_connected:
                 await player.join(vc)
                 await player.load_settings()
                 self._setup_player(player, gid)
@@ -239,8 +239,13 @@ class MusicCog(commands.Cog):
                     except discord.HTTPException:
                         pass
 
-            view = SearchView(entries, vc, self.manager, panel_cb=panel_cb, setup_cb=self._setup_player)
-            await interaction.followup.send(embed=embed, view=view)
+            view = SearchView(
+                entries, vc, self.manager,
+                panel_cb=panel_cb,
+                setup_cb=self._setup_player,
+                cancel_idle_cb=lambda: self._cancel_idle(gid),
+            )
+            view.message = await interaction.followup.send(embed=embed, view=view)
         except Exception as e:
             logger.error(f'/play search error: {e}')
             await interaction.followup.send(f'Search failed: {e}')

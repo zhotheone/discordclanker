@@ -115,6 +115,9 @@ class MusicPlayer:
             await self._on_finished()
             return
 
+        if not self._vc:
+            return
+
         raw = discord.FFmpegPCMAudio(
             stream_url,
             executable=config.FFMPEG_PATH,
@@ -149,6 +152,9 @@ class MusicPlayer:
         asyncio.run_coroutine_threadsafe(self._on_finished(), self._loop)
 
     async def _on_finished(self) -> None:
+        if self._vc and self._vc.is_playing():
+            return
+
         if self._restarting:
             self._restarting = False
             await self._replay_current()
@@ -186,6 +192,10 @@ class MusicPlayer:
     @property
     def current(self) -> Track | None:
         return self.queue.current
+
+    @property
+    def is_connected(self) -> bool:
+        return bool(self._vc and self._vc.is_connected())
 
     @property
     def is_playing(self) -> bool:

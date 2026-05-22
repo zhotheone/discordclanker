@@ -19,8 +19,9 @@ async def get_db() -> aiosqlite.Connection:
 
 async def execute(sql: str, args=None):
     db = await get_db()
+    is_select = sql.strip().upper().startswith('SELECT')
     async with db.execute(sql, args or ()) as cur:
-        await db.commit()
-        if sql.strip().upper().startswith('SELECT'):
+        if is_select:
             rows = await cur.fetchall()
             return [dict(r) for r in rows]
+        await db.commit()

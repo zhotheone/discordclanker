@@ -23,8 +23,11 @@ class Bot(commands.Bot):
             await run_migrations()
         except Exception as e:
             logger.warning(f'DB migrations failed, running without persistence: {e}')
-        synced = await self.tree.sync()
-        logger.info(f'Synced {len(synced)} slash commands globally')
+        if config.SYNC_COMMANDS:
+            synced = await self.tree.sync()
+            logger.info(f'Synced {len(synced)} slash commands globally')
+        else:
+            logger.info('Command sync skipped (SYNC_COMMANDS=false)')
 
     async def on_ready(self) -> None:
         logger.info(f'Logged in as {self.user} | Guilds: {len(self.guilds)}')

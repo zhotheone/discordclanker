@@ -47,13 +47,15 @@ def _sync_extract(url: str, extra: dict) -> dict:
     logger.debug(f'yt-dlp extract: url={url!r}')
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
+    if info is None:
+        raise ValueError(f'yt-dlp returned no info for {url!r}')
     logger.debug(f'yt-dlp result: title={info.get("title")!r}')
     return info
 
 
-async def _extract(url: str, extra: dict = {}) -> dict:
+async def _extract(url: str, extra: dict | None = None) -> dict:
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, partial(_sync_extract, url, extra))
+    return await loop.run_in_executor(None, partial(_sync_extract, url, extra or {}))
 
 
 async def get_video_info(url: str) -> dict:
