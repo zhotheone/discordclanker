@@ -1,0 +1,10 @@
+node_modules/
+.env
+*.txt
+deploy.sh
+.claude
+.venv
+*__pycache__/
+*.log
+*.db
+data/

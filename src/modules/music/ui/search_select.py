@@ -1,0 +1,125 @@
+from typing import Callable, Awaitable, Optional
+import discord
+from loguru import logger
+from ..player.manager import PlayerManager
+from ..player.queue import Track
+from ..player.ytdl import get_video_info, best_stream_url
+
+
+def fmt_dur(seconds) -> str:
+    if not seconds:
+        return 'Unknown'
+    m, s = divmod(int(seconds), 60)
+    return f'{m}:{s:02d}'
+
+
+def _track_embed(track: Track, heading: str) -> discord.Embed:
+    embed = discord.Embed(
+        title=heading,
+        description=f'[{track.title}]({track.url})',
+        color=0xFF0000,
+    ).add_field(name='Duration', value=track.fmt_duration, inline=True)
+    if track.thumbnail:
+        embed.set_thumbnail(url=track.thumbnail)
+    if track.requested_by:
+        embed.set_footer(text=f'Requested by {track.requested_by}')
+    return embed
+
+
+def _loading_embed(title: str, url: str | None = None) -> discord.Embed:
+    desc = f'Loading [{title}]({url})...' if url else f'Loading **{title[:100]}**...'
+    return discord.Embed(title='Loading...', description=desc, color=0xFF0000)
+
+
+class SearchView(discord.ui.View):
+    def __init__(
+        self,
+        results: list,
+        voice_channel: discord.VoiceChannel,
+        manager: PlayerManager,
+        panel_cb: Optional[Callable] = None,
+        setup_cb: Optional[Callable] = None,
+    ) -> None:
+        super().__init__(timeout=60)
+        self.add_item(SearchSelect(results, voice_channel, manager, panel_cb, setup_cb))
+
+    async def on_timeout(self) -> None:
+        for child in self.children:
+            child.disabled = True  # type: ignore[attr-defined]
+
+
+class SearchSelect(discord.ui.Select):
+    def __init__(
+        self,
+        results: list,
+        voice_channel: discord.VoiceChannel,
+        manager: PlayerManager,
+        panel_cb: Optional[Callable] = None,
+        setup_cb: Optional[Callable] = None,
+    ) -> None:
+        self._vc = voice_channel
+        self._manager = manager
+        self._panel_cb = panel_cb
+        self._setup_cb = setup_cb
+        self._url_to_result = {
+            r.get('url') or f"https://www.youtube.com/watch?v={r['id']}": r
+            for r in results[:10]
+        }
+        options = [
+            discord.SelectOption(
+                label=f"{i + 1}. {(r.get('title') or 'Unknown')[:90]}",
+                description=fmt_dur(r.get('duration')),
+                value=r.get('url') or f"https://www.youtube.com/watch?v={r['id']}",
+            )
+            for i, r in enumerate(results[:10])
+        ]
+        super().__init__(placeholder='Choose a track...', min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        url = self.values[0]
+        result = self._url_to_result.get(url, {})
+        known_title = (result.get('title') or 'Unknown')[:100]
+
+        await interaction.response.defer(thinking=True)
+
+        loading = await interaction.followup.send(
+            embed=_loading_embed(known_title)
+        )
+
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not member.voice or not member.voice.channel:
+            await loading.edit(content='Join a voice channel first.', embed=None)
+            return
+        vc = member.voice.channel
+
+        try:
+            info = await get_video_info(url)
+            track = Track(
+                title=info.get('title', 'Unknown'),
+                url=info.get('webpage_url') or url,
+                duration=info.get('duration'),
+                thumbnail=info.get('thumbnail'),
+                requested_by=interaction.user,
+                stream_url=best_stream_url(info),
+            )
+            player = self._manager.get_or_create(interaction.guild)  # type: ignore[arg-type]
+            if not player._vc:
+                await player.join(vc)
+                await player.load_settings()
+                if self._setup_cb:
+                    self._setup_cb(player, interaction.guild_id)
+
+            was_idle = not player.is_playing
+            await player.enqueue(track)
+            heading = 'Now playing' if was_idle else 'Added to queue'
+            embed = _track_embed(track, heading)
+
+            if self._panel_cb:
+                await self._panel_cb(embed, loading)
+            else:
+                await loading.edit(embed=embed)
+
+            self.view.stop()  # type: ignore[union-attr]
+        except Exception as e:
+            logger.error(f'SearchSelect error: {e}')
+            await loading.edit(content=f'Failed: {e}', embed=None)
