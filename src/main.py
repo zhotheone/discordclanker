@@ -37,6 +37,7 @@ async def main() -> None:
     bot = Bot()
     async with bot:
         await bot.start(config.DISCORD_TOKEN)
+    
 
 
 if __name__ == '__main__':

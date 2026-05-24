@@ -8,6 +8,7 @@ import config
 
 _verbose = config.LOG_LEVEL.upper() == 'DEBUG'
 _cookies = config.COOKIES_PATH if os.path.exists(config.COOKIES_PATH) else None
+_proxy = config.YTDLP_PROXY
 
 
 class _YtdlLogger:
@@ -29,6 +30,7 @@ class _YtdlLogger:
 
 _BASE_OPTS: dict[str, Any] = {
     **({'cookiefile': _cookies} if _cookies else {}),
+    **({'proxy': _proxy} if _proxy else {}),
     'quiet': not _verbose,
     'no_warnings': not _verbose,
     'verbose': _verbose,
@@ -78,12 +80,7 @@ def _fmt_formats(info: dict) -> str:
 
 
 def _sync_list_formats(url: str) -> str:
-    opts = {
-        **({'cookiefile': _cookies} if _cookies else {}),
-        'quiet': True,
-        'no_warnings': True,
-        'logger': _YtdlLogger(),
-    }
+    opts = {**_BASE_OPTS, 'quiet': True, 'no_warnings': True, 'verbose': False}
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False, process=False)
