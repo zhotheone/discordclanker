@@ -8,7 +8,7 @@ from loguru import logger
 
 from .player.manager import PlayerManager
 from .player.queue import Track
-from .player.ytdl import get_video_info, search_youtube, best_stream_url
+from .player.ytdl import get_video_info, search_youtube, best_stream_url, list_formats
 from .player.filters import FILTER_NAMES
 from .ui.search_select import SearchView, fmt_dur, _track_embed, _loading_embed
 from .ui.player_view import PlayerView
@@ -197,7 +197,8 @@ class MusicCog(commands.Cog):
                 await self._promote_to_panel(gid, loading, embed)
 
         except Exception as e:
-            logger.error(f'/play url error: {e}')
+            fmts = await list_formats(url)
+            logger.error(f'/play url error: {e}\nAvailable formats:\n{fmts}')
             try:
                 await loading.edit(content=f'Error: {e}', embed=None)
             except discord.HTTPException:

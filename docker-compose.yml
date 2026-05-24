@@ -5,9 +5,8 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      - COOKIES_PATH=/app/cookies.txt
+      - COOKIES_PATH=/app/www.youtube.com_cookies.txt
     volumes:
-      - ./www.youtube.com_cookies.txt:/app/cookies.txt
       - bot_data:/app/data
     networks:
       - internal

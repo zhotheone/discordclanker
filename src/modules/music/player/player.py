@@ -4,7 +4,7 @@ import discord
 from loguru import logger
 from .queue import Queue, Track
 from .filters import build_filter_chain
-from .ytdl import get_video_info, best_stream_url
+from .ytdl import get_video_info, best_stream_url, list_formats
 from db.pool import execute
 import config
 
@@ -111,7 +111,8 @@ class MusicPlayer:
         try:
             stream_url = track.stream_url or best_stream_url(await get_video_info(track.url))
         except Exception as e:
-            logger.error(f'Stream URL error: {e}')
+            fmts = await list_formats(track.url)
+            logger.error(f'Stream URL error: {e}\nAvailable formats:\n{fmts}')
             await self._on_finished()
             return
 

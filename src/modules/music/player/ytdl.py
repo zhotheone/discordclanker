@@ -58,6 +58,45 @@ async def _extract(url: str, extra: dict | None = None) -> dict:
     return await loop.run_in_executor(None, partial(_sync_extract, url, extra or {}))
 
 
+def _fmt_formats(info: dict) -> str:
+    formats = info.get('formats', [])
+    if not formats:
+        return '(no formats)'
+    header = f"{'ID':<12} {'EXT':<6} {'NOTE':<20} {'VCODEC':<16} {'ACODEC':<12} TBR"
+    rows = []
+    for f in formats:
+        tbr = f.get('tbr')
+        rows.append(
+            f"{f.get('format_id', '?'):<12} "
+            f"{f.get('ext', '?'):<6} "
+            f"{(f.get('format_note') or ''):<20} "
+            f"{(f.get('vcodec') or 'none'):<16} "
+            f"{(f.get('acodec') or 'none'):<12} "
+            f"{f'{tbr:.0f}k' if tbr else ''}"
+        )
+    return header + '\n' + '\n'.join(rows)
+
+
+def _sync_list_formats(url: str) -> str:
+    opts = {
+        **({'cookiefile': _cookies} if _cookies else {}),
+        'quiet': True,
+        'no_warnings': True,
+        'logger': _YtdlLogger(),
+    }
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False, process=False)
+        return _fmt_formats(info or {})
+    except Exception as e:
+        return f'(list_formats failed: {e})'
+
+
+async def list_formats(url: str) -> str:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, partial(_sync_list_formats, url))
+
+
 async def get_video_info(url: str) -> dict:
     return await _extract(url, {'format': 'bestaudio/best'})
 
