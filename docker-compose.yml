@@ -8,11 +8,13 @@ services:
       - COOKIES_PATH=/app/www.youtube.com_cookies.txt
     volumes:
       - bot_data:/app/data
+      - bot_cache:/app/cache
     networks:
       - internal
 
 volumes:
   bot_data:
+  bot_cache:
 
 networks:
   internal:

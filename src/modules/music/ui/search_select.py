@@ -4,31 +4,7 @@ from loguru import logger
 from ..player.manager import PlayerManager
 from ..player.queue import Track
 from ..player.ytdl import get_video_info, best_stream_url
-
-
-def fmt_dur(seconds) -> str:
-    if not seconds:
-        return 'Unknown'
-    m, s = divmod(int(seconds), 60)
-    return f'{m}:{s:02d}'
-
-
-def _track_embed(track: Track, heading: str) -> discord.Embed:
-    embed = discord.Embed(
-        title=heading,
-        description=f'[{track.title}]({track.url})',
-        color=0xFF0000,
-    ).add_field(name='Duration', value=track.fmt_duration, inline=True)
-    if track.thumbnail:
-        embed.set_thumbnail(url=track.thumbnail)
-    if track.requested_by:
-        embed.set_footer(text=f'Requested by {track.requested_by}')
-    return embed
-
-
-def _loading_embed(title: str, url: str | None = None) -> discord.Embed:
-    desc = f'Loading [{title}]({url})...' if url else f'Loading **{title[:100]}**...'
-    return discord.Embed(title='Loading...', description=desc, color=0xFF0000)
+from .embeds import fmt_dur, track_embed, loading_embed
 
 
 class SearchView(discord.ui.View):
@@ -92,7 +68,7 @@ class SearchSelect(discord.ui.Select):
         await interaction.response.defer(thinking=True)
 
         loading = await interaction.followup.send(
-            embed=_loading_embed(known_title)
+            embed=loading_embed(known_title)
         )
 
         member = interaction.user
@@ -123,7 +99,7 @@ class SearchSelect(discord.ui.Select):
             was_idle = not player.is_playing
             await player.enqueue(track)
             heading = 'Now playing' if was_idle else 'Added to queue'
-            embed = _track_embed(track, heading)
+            embed = track_embed(track, heading)
 
             if self._panel_cb:
                 await self._panel_cb(embed, loading)

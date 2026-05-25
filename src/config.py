@@ -13,3 +13,6 @@ YTDLP_PROXY: str | None = os.getenv('YTDLP_PROXY') or None
 FFMPEG_PATH: str = os.getenv('FFMPEG_PATH', 'ffmpeg')
 LOG_LEVEL: str = os.getenv('LOG_LEVEL', 'DEBUG')
 SYNC_COMMANDS: bool = os.getenv('SYNC_COMMANDS', 'true').lower() == 'true'
+
+CACHE_DIR: str = os.getenv('CACHE_DIR', './cache')
+CACHE_MAX_BYTES: int = int(os.getenv('CACHE_MAX_GB', '5')) * 1024 ** 3

@@ -5,6 +5,7 @@ from loguru import logger
 from .queue import Queue, Track
 from .filters import build_filter_chain
 from .ytdl import get_video_info, best_stream_url, list_formats
+from .cache import audio_cache
 from db.pool import execute
 import config
 
@@ -108,13 +109,22 @@ class MusicPlayer:
 
     async def _start_track(self, track: Track, log_history: bool = True) -> None:
         logger.info(f'Playing {track.title!r} | guild={self.guild.id}')
-        try:
-            stream_url = track.stream_url or best_stream_url(await get_video_info(track.url))
-        except Exception as e:
-            fmts = await list_formats(track.url)
-            logger.error(f'Stream URL error: {e}\nAvailable formats:\n{fmts}')
-            await self._on_finished()
-            return
+
+        cached = audio_cache.get(track.url)
+        if cached:
+            stream_url = cached
+            before_options = ''
+            logger.debug(f'Cache hit: {track.url}')
+        else:
+            try:
+                stream_url = track.stream_url or best_stream_url(await get_video_info(track.url))
+            except Exception as e:
+                fmts = await list_formats(track.url)
+                logger.error(f'Stream URL error: {e}\nAvailable formats:\n{fmts}')
+                await self._on_finished()
+                return
+            before_options = '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
+            await audio_cache.schedule_download(track.url)
 
         if not self._vc:
             return
@@ -122,7 +132,7 @@ class MusicPlayer:
         raw = discord.FFmpegPCMAudio(
             stream_url,
             executable=config.FFMPEG_PATH,
-            before_options='-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+            before_options=before_options,
             options=f'-af "{build_filter_chain(self.filter)}" -vn',
         )
         self._source = discord.PCMVolumeTransformer(raw, volume=self.volume)

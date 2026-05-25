@@ -3,7 +3,13 @@ from typing import Callable, Awaitable, Optional
 import discord
 from ..player.manager import PlayerManager
 from ..player.filters import FILTER_NAMES
-from .search_select import _track_embed
+from .embeds import track_embed, queue_embed
+
+_REPEAT_LABELS: dict[str, tuple[str, str, discord.ButtonStyle]] = {
+    'off':   ('Repeat: Off',   '🔁', discord.ButtonStyle.secondary),
+    'one':   ('Repeat: One',   '🔂', discord.ButtonStyle.success),
+    'queue': ('Repeat: Queue', '🔁', discord.ButtonStyle.primary),
+}
 
 
 class VolumeModal(discord.ui.Modal, title='Set Volume'):
@@ -63,22 +69,17 @@ class PlayerView(discord.ui.View):
         manager: PlayerManager,
         guild_id: int,
         refresh_cb: Optional[Callable[[], Awaitable[None]]] = None,
-        presence_cb: Optional[Callable[[], Awaitable[None]]] = None,
+        pause_cb: Optional[Callable[[bool], Awaitable[None]]] = None,
     ) -> None:
         super().__init__(timeout=3600)
         self._manager = manager
         self._guild_id = guild_id
         self._refresh_cb = refresh_cb
-        self._presence_cb = presence_cb
+        self._pause_cb = pause_cb
         self.add_item(FilterSelect(manager, guild_id, refresh_cb))
         player = manager.get(guild_id)
         if player:
-            _repeat_labels = {
-                'off': ('Repeat: Off', '🔁', discord.ButtonStyle.secondary),
-                'one': ('Repeat: One', '🔂', discord.ButtonStyle.success),
-                'queue': ('Repeat: Queue', '🔁', discord.ButtonStyle.primary),
-            }
-            label, emoji, style = _repeat_labels[player.repeat]
+            label, emoji, style = _REPEAT_LABELS[player.repeat]
             self.repeat.label = label
             self.repeat.emoji = emoji
             self.repeat.style = style
@@ -90,7 +91,7 @@ class PlayerView(discord.ui.View):
         player = self._player()
         if player and player.current:
             title = '▶ Now Playing' if player.is_playing else '⏸ Paused'
-            return _track_embed(player.current, title)
+            return track_embed(player.current, title, elapsed=player.elapsed_time)
         return discord.Embed(title='Music Controls', color=0xFF0000, description='Nothing playing.')
 
     async def _refresh(self) -> None:
@@ -108,8 +109,8 @@ class PlayerView(discord.ui.View):
         button.label = 'Resume' if result else 'Pause'
         button.emoji = '▶' if result else '⏸'
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
-        if self._presence_cb:
-            asyncio.create_task(self._presence_cb())
+        if self._pause_cb:
+            asyncio.create_task(self._pause_cb(result))
 
     @discord.ui.button(label='Skip', emoji='⏭', style=discord.ButtonStyle.secondary, row=0)
     async def skip(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -135,27 +136,7 @@ class PlayerView(discord.ui.View):
         player = self._player()
         if not player or (not player.current and player.queue.is_empty):
             return await interaction.response.send_message('The queue is empty.', ephemeral=True)
-        embed = discord.Embed(title='Queue', color=0xFF0000)
-        cur = player.current
-        if cur:
-            icon = '▶' if player.is_playing else '⏸'
-            embed.add_field(
-                name=f'{icon} Now Playing',
-                value=f'[{cur.title}]({cur.url}) `{cur.fmt_duration}`',
-                inline=False,
-            )
-        upcoming = player.queue.peek(10)
-        if upcoming:
-            count = player.queue.size
-            embed.add_field(
-                name=f'Up Next ({count} track{"s" if count != 1 else ""})',
-                value='\n'.join(
-                    f'**{i+1}.** [{t.title[:55]}]({t.url}) `{t.fmt_duration}`'
-                    for i, t in enumerate(upcoming)
-                ),
-                inline=False,
-            )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.response.send_message(embed=queue_embed(player), ephemeral=True)
 
     @discord.ui.button(label='Volume', emoji='🔊', style=discord.ButtonStyle.secondary, row=0)
     async def volume(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -177,8 +158,5 @@ class PlayerView(discord.ui.View):
             return await interaction.response.send_message('Nothing is playing.', ephemeral=True)
         cycle = {'off': 'one', 'one': 'queue', 'queue': 'off'}
         player.repeat = cycle[player.repeat]
-        labels = {'off': ('Repeat: Off', '🔁', discord.ButtonStyle.secondary),
-                  'one': ('Repeat: One', '🔂', discord.ButtonStyle.success),
-                  'queue': ('Repeat: Queue', '🔁', discord.ButtonStyle.primary)}
-        button.label, button.emoji, button.style = labels[player.repeat]
+        button.label, button.emoji, button.style = _REPEAT_LABELS[player.repeat]
         await interaction.response.edit_message(view=self)

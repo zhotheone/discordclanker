@@ -10,22 +10,66 @@ from .player.manager import PlayerManager
 from .player.queue import Track
 from .player.ytdl import get_video_info, search_youtube, best_stream_url, list_formats
 from .player.filters import FILTER_NAMES
-from .ui.search_select import SearchView, fmt_dur, _track_embed, _loading_embed
+from .ui.search_select import SearchView
+from .ui.embeds import fmt_dur, track_embed, loading_embed, queue_embed
 from .ui.player_view import PlayerView
 
 _YT_RE = re.compile(r'^(https?://)?(www\.)?(youtube\.com|youtu\.be)/')
-_TIMEOUT = 60
+
+_ALONE_TIMEOUT  = 60
+_IDLE_TIMEOUT   = 60
+_PAUSED_TIMEOUT = 300
+_PROGRESS_INTERVAL = 15
+
+
+class GuildSession:
+    """Per-guild state: the panel message and all named background tasks."""
+
+    __slots__ = ('panel', '_tasks')
+
+    def __init__(self) -> None:
+        self.panel: discord.Message | None = None
+        self._tasks: dict[str, asyncio.Task] = {}
+
+    def start(self, name: str, coro) -> None:
+        """(Re)start a named task, cancelling any prior instance."""
+        old = self._tasks.pop(name, None)
+        if old and not old.done():
+            old.cancel()
+        self._tasks[name] = asyncio.create_task(coro)
+
+    def cancel(self, *names: str) -> None:
+        for name in names:
+            task = self._tasks.pop(name, None)
+            if task and not task.done():
+                task.cancel()
+
+    def teardown(self) -> None:
+        for task in self._tasks.values():
+            if not task.done():
+                task.cancel()
+        self._tasks.clear()
+        self.panel = None
 
 
 class MusicCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         self.manager = PlayerManager()
-        self._panels: dict[int, discord.Message] = {}
-        self._alone_tasks: dict[int, asyncio.Task] = {}
-        self._idle_tasks: dict[int, asyncio.Task] = {}
+        self._sessions: dict[int, GuildSession] = {}
 
-    # ── Presence ───────────────────────────────────────────────────────────
+    def _session(self, guild_id: int) -> GuildSession:
+        if guild_id not in self._sessions:
+            self._sessions[guild_id] = GuildSession()
+        return self._sessions[guild_id]
+
+    def _teardown(self, guild_id: int) -> None:
+        session = self._sessions.pop(guild_id, None)
+        if session:
+            session.teardown()
+        self.manager.destroy(guild_id)
+
+    # ── Presence ──────────────────────────────────────────────────────────────
 
     async def _update_presence(self) -> None:
         playing = [
@@ -50,8 +94,6 @@ class MusicCog(commands.Cog):
         track = player.current
 
         if player.is_paused:
-            # Remove timestamps when paused — Discord's timer would keep counting
-            # even though audio is frozen, making the bar drift ahead of reality.
             await self.bot.change_presence(
                 activity=discord.Activity(
                     type=discord.ActivityType.listening,
@@ -59,8 +101,6 @@ class MusicCog(commands.Cog):
                 )
             )
         else:
-            # Build Activity with start/end so Discord renders the progress bar
-            # natively without us needing to poll.
             kwargs: dict = dict(
                 type=discord.ActivityType.listening,
                 name=track.title,  # type: ignore[union-attr]
@@ -75,76 +115,57 @@ class MusicCog(commands.Cog):
                     )
             await self.bot.change_presence(activity=discord.Activity(**kwargs))
 
-    # ── Panel helpers ──────────────────────────────────────────────────────
+    # ── Panel helpers ──────────────────────────────────────────────────────────
 
     def _make_view(self, guild_id: int) -> PlayerView:
-        async def refresh():
+        async def refresh() -> None:
             await self._refresh_panel(guild_id)
-        return PlayerView(
-            self.manager, guild_id,
-            refresh_cb=refresh,
-            presence_cb=self._update_presence,
-        )
+
+        async def on_pause(paused: bool) -> None:
+            await self._on_pause_change(guild_id, paused)
+
+        return PlayerView(self.manager, guild_id, refresh_cb=refresh, pause_cb=on_pause)
 
     async def _refresh_panel(self, guild_id: int) -> None:
-        msg = self._panels.get(guild_id)
-        if not msg:
+        session = self._sessions.get(guild_id)
+        if not session or not session.panel:
             return
+        view = self._make_view(guild_id)
         try:
-            view = self._make_view(guild_id)
+            await session.panel.edit(embed=view.build_embed(), view=view)
+        except discord.NotFound:
+            session.panel = None
+        except discord.HTTPException:
+            pass
+
+    async def _set_panel(self, guild_id: int, msg: discord.Message) -> None:
+        """Register msg as the Now Playing panel and immediately render it with the progress bar."""
+        session = self._session(guild_id)
+        session.panel = msg
+        view = self._make_view(guild_id)
+        try:
             await msg.edit(embed=view.build_embed(), view=view)
-        except discord.NotFound:
-            self._panels.pop(guild_id, None)
         except discord.HTTPException:
             pass
-
-    async def _promote_to_panel(
-        self,
-        guild_id: int,
-        msg: discord.Message,
-        embed: discord.Embed,
-    ) -> None:
-        view = self._make_view(guild_id)
-        self._panels[guild_id] = msg
-        try:
-            await msg.edit(embed=embed, view=view)
-        except discord.HTTPException:
-            pass
-
-    async def _update_existing_panel(
-        self,
-        guild_id: int,
-        embed: discord.Embed,
-    ) -> bool:
-        msg = self._panels.get(guild_id)
-        if not msg:
-            return False
-        view = self._make_view(guild_id)
-        try:
-            await msg.edit(embed=embed, view=view)
-            return True
-        except discord.NotFound:
-            self._panels.pop(guild_id, None)
-            return False
-        except discord.HTTPException:
-            return True
 
     def _setup_player(self, player, guild_id: int) -> None:
-        async def on_track_start():
+        async def on_track_start() -> None:
+            session = self._session(guild_id)
+            session.cancel('paused')
+            session.start('progress', self._progress_loop(guild_id))
             await self._refresh_panel(guild_id)
             await self._update_presence()
 
-        async def on_idle():
-            if guild_id not in self._idle_tasks or self._idle_tasks[guild_id].done():
-                self._idle_tasks[guild_id] = asyncio.create_task(
-                    self._idle_timeout(guild_id)
-                )
+        async def on_idle() -> None:
+            session = self._session(guild_id)
+            session.cancel('progress')
+            session.start('idle', self._idle_timeout(guild_id))
             await self._update_presence()
 
         player.on_track_start = on_track_start
         player.on_idle = on_idle
 
-    # ── /play ──────────────────────────────────────────────────────────────
+    # ── /play ──────────────────────────────────────────────────────────────────
 
     @app_commands.command(name='play', description='Play a YouTube URL or search for a track')
     @app_commands.describe(query='YouTube URL or search query')
@@ -160,10 +181,14 @@ class MusicCog(commands.Cog):
         else:
             await self._show_search(interaction, vc, query)
 
-    async def _play_url(self, interaction: discord.Interaction, vc: discord.VoiceChannel, url: str) -> None:
+    async def _play_url(
+        self,
+        interaction: discord.Interaction,
+        vc: discord.VoiceChannel,
+        url: str,
+    ) -> None:
         gid: int = interaction.guild_id  # type: ignore[assignment]
-
-        loading = await interaction.followup.send(embed=_loading_embed('Fetching track info...'))
+        loading = await interaction.followup.send(embed=loading_embed('Fetching track info...'))
         try:
             info = await get_video_info(url)
             track = Track(
@@ -181,20 +206,18 @@ class MusicCog(commands.Cog):
                 await player.load_settings()
                 self._setup_player(player, gid)
 
-            self._cancel_idle(gid)
-            was_idle = not player.is_playing
+            session = self._session(gid)
+            session.cancel('idle')
             await player.enqueue(track)
-            heading = 'Now playing' if was_idle else 'Added to queue'
-            embed = _track_embed(track, heading)
 
-            existing_still_valid = await self._update_existing_panel(gid, embed)
-            if existing_still_valid:
+            if session.panel:
+                await self._refresh_panel(gid)
                 try:
                     await loading.edit(content=f'Added to queue: **{track.title}**', embed=None)
                 except discord.HTTPException:
                     pass
             else:
-                await self._promote_to_panel(gid, loading, embed)
+                await self._set_panel(gid, loading)
 
         except Exception as e:
             fmts = await list_formats(url)
@@ -204,7 +227,12 @@ class MusicCog(commands.Cog):
             except discord.HTTPException:
                 pass
 
-    async def _show_search(self, interaction: discord.Interaction, vc: discord.VoiceChannel, query: str) -> None:
+    async def _show_search(
+        self,
+        interaction: discord.Interaction,
+        vc: discord.VoiceChannel,
+        query: str,
+    ) -> None:
         gid: int = interaction.guild_id  # type: ignore[assignment]
         try:
             results = await search_youtube(query, 10)
@@ -219,24 +247,24 @@ class MusicCog(commands.Cog):
             )
             embed = discord.Embed(title=f'Search: {query}', description=desc, color=0xFF0000)
 
-            async def panel_cb(track_embed: discord.Embed, loading_msg=None) -> None:
-                existing_valid = await self._update_existing_panel(gid, track_embed)
-                if existing_valid:
+            async def panel_cb(_: discord.Embed, loading_msg: discord.Message | None = None) -> None:
+                session = self._session(gid)
+                if session.panel:
+                    await self._refresh_panel(gid)
                     if loading_msg:
                         try:
                             await loading_msg.edit(content='Added to queue.', embed=None)
                         except discord.HTTPException:
                             pass
-                    return
-
-                if loading_msg:
-                    await self._promote_to_panel(gid, loading_msg, track_embed)
+                elif loading_msg:
+                    await self._set_panel(gid, loading_msg)
                 else:
                     try:
+                        view = self._make_view(gid)
                         msg = await interaction.channel.send(  # type: ignore[union-attr]
-                            embed=track_embed, view=self._make_view(gid)
+                            embed=view.build_embed(), view=view,
                         )
-                        self._panels[gid] = msg
+                        session.panel = msg
                     except discord.HTTPException:
                         pass
 
@@ -244,14 +272,14 @@ class MusicCog(commands.Cog):
                 entries, vc, self.manager,
                 panel_cb=panel_cb,
                 setup_cb=self._setup_player,
-                cancel_idle_cb=lambda: self._cancel_idle(gid),
+                cancel_idle_cb=lambda: self._session(gid).cancel('idle'),
             )
             view.message = await interaction.followup.send(embed=embed, view=view)
         except Exception as e:
             logger.error(f'/play search error: {e}')
             await interaction.followup.send(f'Search failed: {e}')
 
-    # ── /pause ─────────────────────────────────────────────────────────────
+    # ── /pause ─────────────────────────────────────────────────────────────────
 
     @app_commands.command(name='pause', description='Toggle pause / resume')
     async def pause(self, interaction: discord.Interaction) -> None:
@@ -262,11 +290,11 @@ class MusicCog(commands.Cog):
         result = player.pause()
         if result is None:
             return await interaction.response.send_message('Nothing to pause or resume.', ephemeral=True)
+        await self._on_pause_change(gid, result)
         await interaction.response.send_message('Paused.' if result else 'Resumed.', ephemeral=True)
         asyncio.create_task(self._refresh_panel(gid))
-        asyncio.create_task(self._update_presence())
 
-    # ── /skip ──────────────────────────────────────────────────────────────
+    # ── /skip ──────────────────────────────────────────────────────────────────
 
     @app_commands.command(name='skip', description='Skip the current track')
     async def skip(self, interaction: discord.Interaction) -> None:
@@ -278,21 +306,18 @@ class MusicCog(commands.Cog):
         player.skip()
         await interaction.response.send_message(f'Skipped **{title}**.', ephemeral=True)
 
-    # ── /stop ──────────────────────────────────────────────────────────────
+    # ── /stop ──────────────────────────────────────────────────────────────────
 
     @app_commands.command(name='stop', description='Stop playback, clear queue and disconnect')
     async def stop(self, interaction: discord.Interaction) -> None:
         gid: int = interaction.guild_id  # type: ignore[assignment]
         if not self.manager.get(gid):
             return await interaction.response.send_message('Nothing is playing.', ephemeral=True)
-        self._cancel_alone(gid)
-        self._cancel_idle(gid)
-        self.manager.destroy(gid)
-        self._panels.pop(gid, None)
+        self._teardown(gid)
         await interaction.response.send_message('Stopped and disconnected.')
         await self._update_presence()
 
-    # ── /queue ─────────────────────────────────────────────────────────────
+    # ── /queue ─────────────────────────────────────────────────────────────────
 
     @app_commands.command(name='queue', description='Show the current queue')
     async def queue(self, interaction: discord.Interaction) -> None:
@@ -300,30 +325,9 @@ class MusicCog(commands.Cog):
         player = self.manager.get(gid)
         if not player or (not player.current and player.queue.is_empty):
             return await interaction.response.send_message('The queue is empty.', ephemeral=True)
+        await interaction.response.send_message(embed=queue_embed(player), ephemeral=True)
 
-        embed = discord.Embed(title='Queue', color=0xFF0000)
-        cur = player.current
-        if cur:
-            icon = '▶' if player.is_playing else '⏸'
-            embed.add_field(
-                name=f'{icon} Now Playing',
-                value=f'[{cur.title}]({cur.url}) `{cur.fmt_duration}`\nRequested by {cur.requested_by}',
-                inline=False,
-            )
-        upcoming = player.queue.peek(10)
-        if upcoming:
-            count = player.queue.size
-            embed.add_field(
-                name=f'Up Next ({count} track{"s" if count != 1 else ""})',
-                value='\n'.join(
-                    f'**{i + 1}.** [{t.title[:55]}]({t.url}) `{t.fmt_duration}`'
-                    for i, t in enumerate(upcoming)
-                ),
-                inline=False,
-            )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    # ── /filter ────────────────────────────────────────────────────────────
+    # ── /filter ────────────────────────────────────────────────────────────────
 
     @app_commands.command(name='filter', description='Set audio filter (takes effect on next track)')
     @app_commands.describe(name='Filter to apply')
@@ -337,7 +341,7 @@ class MusicCog(commands.Cog):
         await interaction.response.send_message(f'Filter set to **{name}**.', ephemeral=True)
         asyncio.create_task(self._refresh_panel(gid))
 
-    # ── /volume ────────────────────────────────────────────────────────────
+    # ── /volume ────────────────────────────────────────────────────────────────
 
     @app_commands.command(name='volume', description='Set playback volume (0–100)')
     @app_commands.describe(level='Volume level (0–100)')
@@ -349,19 +353,53 @@ class MusicCog(commands.Cog):
             await player.save_settings()
         await interaction.response.send_message(f'Volume set to **{level}%**.', ephemeral=True)
 
-    # ── Task cancellation ──────────────────────────────────────────────────
+    # ── Pause/resume ───────────────────────────────────────────────────────────
 
-    def _cancel_alone(self, guild_id: int) -> None:
-        task = self._alone_tasks.pop(guild_id, None)
-        if task and not task.done():
-            task.cancel()
+    async def _on_pause_change(self, guild_id: int, paused: bool) -> None:
+        session = self._session(guild_id)
+        if paused:
+            session.cancel('progress')
+            session.start('paused', self._paused_timeout(guild_id))
+        else:
+            session.cancel('paused')
+            session.start('progress', self._progress_loop(guild_id))
+        await self._update_presence()
 
-    def _cancel_idle(self, guild_id: int) -> None:
-        task = self._idle_tasks.pop(guild_id, None)
-        if task and not task.done():
-            task.cancel()
+    # ── Background tasks ───────────────────────────────────────────────────────
 
-    # ── Auto-leave: alone ──────────────────────────────────────────────────
+    async def _progress_loop(self, guild_id: int) -> None:
+        while True:
+            await asyncio.sleep(_PROGRESS_INTERVAL)
+            player = self.manager.get(guild_id)
+            if not player or not player.is_playing:
+                break
+            await self._refresh_panel(guild_id)
+
+    async def _paused_timeout(self, guild_id: int) -> None:
+        await asyncio.sleep(_PAUSED_TIMEOUT)
+        player = self.manager.get(guild_id)
+        if player and player.is_paused:
+            logger.info(f'Auto-leaving guild={guild_id}: paused for {_PAUSED_TIMEOUT}s')
+            self._teardown(guild_id)
+            await self._update_presence()
+
+    async def _idle_timeout(self, guild_id: int) -> None:
+        await asyncio.sleep(_IDLE_TIMEOUT)
+        player = self.manager.get(guild_id)
+        if player and not player.is_playing and not player.is_paused:
+            logger.info(f'Auto-leaving guild={guild_id}: idle for {_IDLE_TIMEOUT}s')
+            self._teardown(guild_id)
+            await self._update_presence()
+
+    async def _alone_timeout(self, guild_id: int) -> None:
+        await asyncio.sleep(_ALONE_TIMEOUT)
+        player = self.manager.get(guild_id)
+        if player and player._vc and not any(not m.bot for m in player._vc.channel.members):
+            logger.info(f'Auto-leaving guild={guild_id}: alone for {_ALONE_TIMEOUT}s')
+            self._teardown(guild_id)
+            await self._update_presence()
+
+    # ── Voice events ───────────────────────────────────────────────────────────
 
     @commands.Cog.listener()
     async def on_voice_state_update(
@@ -379,36 +417,9 @@ class MusicCog(commands.Cog):
 
         humans = [m for m in player._vc.channel.members if not m.bot]
         if not humans:
-            if guild_id not in self._alone_tasks or self._alone_tasks[guild_id].done():
-                self._alone_tasks[guild_id] = asyncio.create_task(
-                    self._alone_timeout(guild_id)
-                )
+            self._session(guild_id).start('alone', self._alone_timeout(guild_id))
         else:
-            self._cancel_alone(guild_id)
-
-    async def _alone_timeout(self, guild_id: int) -> None:
-        await asyncio.sleep(_TIMEOUT)
-        self._alone_tasks.pop(guild_id, None)
-        player = self.manager.get(guild_id)
-        if player and player._vc and not any(not m.bot for m in player._vc.channel.members):
-            logger.info(f'Auto-leaving guild={guild_id}: alone for {_TIMEOUT}s')
-            self._cancel_idle(guild_id)
-            self.manager.destroy(guild_id)
-            self._panels.pop(guild_id, None)
-            await self._update_presence()
-
-    # ── Auto-leave: idle ───────────────────────────────────────────────────
-
-    async def _idle_timeout(self, guild_id: int) -> None:
-        await asyncio.sleep(_TIMEOUT)
-        self._idle_tasks.pop(guild_id, None)
-        player = self.manager.get(guild_id)
-        if player and not player.is_playing and not player.is_paused:
-            logger.info(f'Auto-leaving guild={guild_id}: idle for {_TIMEOUT}s')
-            self._cancel_alone(guild_id)
-            self.manager.destroy(guild_id)
-            self._panels.pop(guild_id, None)
-            await self._update_presence()
+            self._session(guild_id).cancel('alone')
 
 
 async def setup(bot: commands.Bot) -> None:
